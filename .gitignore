@@ -1,0 +1,18 @@
+# Publish source files only. Results, transcripts and local credentials stay private.
+/*
+!/.gitignore
+!/README.md
+!/LICENSE
+!/infra.py
+!/run_benchmark.py
+!/worker.py
+!/durable.py
+!/watchdog.py
+!/setup.sh
+!/test_benchmark.py
+!/test_resume.py
+!/.github/
+/.github/*
+!/.github/workflows/
+/.github/workflows/*
+!/.github/workflows/tests.yml
