@@ -32,6 +32,172 @@ def artifact_view(job, result=None, ok=True):
             "output": f"BENCH_FILE:{job['job_id']}.b64:{len(encoded)}:{checksum}\nBENCH_DATA:{encoded}"}
 
 
+class CredentialsTests(unittest.TestCase):
+    ACCOUNT = "00000000-0000-0000-0000-000000000001/1234abcd"
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.home = Path(temporary.name)
+        home = patch("infra.Path.home", return_value=self.home)
+        home.start()
+        self.addCleanup(home.stop)
+        self.store = infra.FileCredentials()
+        self.path = self.store.path / self.ACCOUNT.replace("/", "-")
+
+    def test_platform_defaults_and_explicit_selection(self):
+        for platform, expected in (("darwin", "keychain"), ("linux", "file")):
+            with (self.subTest(platform=platform), patch("infra.sys.platform", platform),
+                  patch("infra.KeychainCredentials") as keychain,
+                  patch("infra.FileCredentials") as files):
+                self.assertEqual(infra.default_credential_store(), expected)
+                store = infra.Credentials()
+                selected, other = (keychain, files) if expected == "keychain" else (files, keychain)
+                self.assertIs(store.store, selected.return_value)
+                other.assert_not_called()
+                explicit = infra.Credentials("file" if expected == "keychain" else "keychain")
+                self.assertIs(explicit.store, other.return_value)
+        with self.assertRaisesRegex(RuntimeError, "Unknown credential store"):
+            infra.Credentials("unsupported")
+
+    def test_keychain_adapter_keeps_existing_operations(self):
+        with patch("infra.KeychainCredentials") as backend:
+            store = infra.Credentials("keychain")
+            self.assertIs(store.create(self.ACCOUNT), backend.return_value.create.return_value)
+            self.assertIs(store.get(self.ACCOUNT), backend.return_value.get.return_value)
+            store.delete(self.ACCOUNT)
+            backend.return_value.create.assert_called_once_with(self.ACCOUNT)
+            backend.return_value.get.assert_called_once_with(self.ACCOUNT)
+            backend.return_value.delete.assert_called_once_with(self.ACCOUNT)
+
+    def test_keychain_is_not_replaced_silently_on_linux(self):
+        with patch("infra.sys.platform", "linux"), patch("infra.ctypes.CDLL") as api:
+            with self.assertRaisesRegex(RuntimeError, "original Mac"):
+                infra.Credentials("keychain")
+            api.assert_not_called()
+        self.assertFalse(self.store.path.exists())
+
+    def test_file_lifecycle_has_private_permissions_and_no_keychain_dependency(self):
+        with patch("infra.sys.platform", "linux"), patch("infra.ctypes.CDLL") as api:
+            store = infra.Credentials()
+            value = store.create(self.ACCOUNT)
+            self.assertRegex(value, r"^B9![A-Za-z0-9_-]{38}$")
+            self.assertEqual(self.store.path.stat().st_mode & 0o777, 0o700)
+            self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+            self.assertEqual(self.path.read_text(), value + "\n")
+            self.assertEqual(infra.Credentials().get(self.ACCOUNT), value)
+            with self.assertRaisesRegex(RuntimeError, "Refusing to replace"):
+                store.create(self.ACCOUNT)
+            self.assertEqual(store.get(self.ACCOUNT), value)
+            other_account = self.ACCOUNT.replace("1234abcd", "abcd1234")
+            other_value = store.create(other_account)
+            store.delete(self.ACCOUNT)
+            self.assertFalse(self.path.exists())
+            self.assertEqual(store.get(other_account), other_value)
+            store.delete(other_account)
+            store.delete(self.ACCOUNT)
+            api.assert_not_called()
+
+    def test_missing_credentials_do_not_create_a_directory(self):
+        with self.assertRaisesRegex(RuntimeError, "missing"):
+            self.store.get(self.ACCOUNT)
+        self.store.delete(self.ACCOUNT)
+        self.assertFalse(self.store.path.exists())
+
+    def test_accounts_cannot_escape_the_credential_directory(self):
+        for account in ("../outside", "/tmp/credential", self.ACCOUNT + "/../other"):
+            for operation in (self.store.create, self.store.get, self.store.delete):
+                with self.subTest(account=account, operation=operation.__name__):
+                    with self.assertRaisesRegex(RuntimeError, "Invalid credential account"):
+                        operation(account)
+        self.assertEqual(list(self.home.iterdir()), [])
+
+    def test_unsafe_directory_permissions_or_owner_are_rejected(self):
+        self.store.create(self.ACCOUNT)
+        self.store.path.chmod(0o755)
+        for operation in (self.store.create, self.store.get, self.store.delete):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaisesRegex(RuntimeError, "mode 0700"):
+                    operation(self.ACCOUNT)
+        self.store.path.chmod(0o700)
+        with patch("infra.os.getuid", return_value=os.getuid() + 1):
+            with self.assertRaisesRegex(RuntimeError, "current user"):
+                self.store.get(self.ACCOUNT)
+
+    def test_unsafe_file_permissions_or_owner_are_rejected(self):
+        self.store.create(self.ACCOUNT)
+        self.path.chmod(0o644)
+        for operation in (self.store.get, self.store.delete):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaisesRegex(RuntimeError, "mode 0600"):
+                    operation(self.ACCOUNT)
+        self.path.chmod(0o600)
+        original_fstat = os.fstat
+
+        def foreign_file(descriptor):
+            info = original_fstat(descriptor)
+            if info.st_ino == self.path.stat().st_ino:
+                return SimpleNamespace(st_mode=info.st_mode, st_nlink=info.st_nlink,
+                                       st_uid=info.st_uid + 1)
+            return info
+
+        with patch("infra.os.fstat", side_effect=foreign_file):
+            with self.assertRaisesRegex(RuntimeError, "current user"):
+                self.store.get(self.ACCOUNT)
+
+    def test_symlinked_directory_is_rejected(self):
+        target = self.home / "other"
+        target.mkdir(mode=0o700)
+        self.store.path.symlink_to(target, target_is_directory=True)
+        for operation in (self.store.create, self.store.get, self.store.delete):
+            with self.subTest(operation=operation.__name__), self.assertRaises(OSError):
+                operation(self.ACCOUNT)
+        self.assertEqual(list(target.iterdir()), [])
+
+    def test_symlinked_or_hardlinked_file_is_rejected(self):
+        value = self.store.create(self.ACCOUNT)
+        target = self.home / "other"
+        self.path.rename(target)
+        self.path.symlink_to(target)
+        for operation in (self.store.get, self.store.delete):
+            with self.subTest(operation=operation.__name__), self.assertRaises(OSError):
+                operation(self.ACCOUNT)
+        with self.assertRaisesRegex(RuntimeError, "Refusing to replace"):
+            self.store.create(self.ACCOUNT)
+        self.path.unlink()
+        self.path.hardlink_to(target)
+        for operation in (self.store.get, self.store.delete):
+            with self.subTest(operation=operation.__name__):
+                with self.assertRaisesRegex(RuntimeError, "single-link"):
+                    operation(self.ACCOUNT)
+        self.assertEqual(target.read_text(), value + "\n")
+
+    def test_non_regular_or_corrupt_file_is_rejected(self):
+        self.store.create(self.ACCOUNT)
+        self.path.unlink()
+        os.mkfifo(self.path, mode=0o600)
+        with self.assertRaisesRegex(RuntimeError, "regular"):
+            self.store.get(self.ACCOUNT)
+        self.path.unlink()
+        for value in ("", "truncated", "B9!" + "x" * 38 + "\nextra"):
+            with self.subTest(value=value):
+                self.path.touch(mode=0o600)
+                self.path.write_text(value)
+                with self.assertRaisesRegex(RuntimeError, "invalid"):
+                    self.store.get(self.ACCOUNT)
+
+    def test_failed_flush_or_round_trip_is_not_reported_as_success(self):
+        with self.store.directory(create=True):
+            pass
+        with patch("infra.os.fsync", side_effect=OSError("disk failure")):
+            with self.assertRaisesRegex(OSError, "disk failure"):
+                self.store.create(self.ACCOUNT)
+        self.path.unlink()
+        with patch.object(self.store, "read", return_value="different"):
+            with self.assertRaisesRegex(RuntimeError, "round-trip"):
+                self.store.create(self.ACCOUNT)
+
+
 class ResumeTests(unittest.TestCase):
     def setUp(self):
         subscription = patch("infra.SUBSCRIPTION", "00000000-0000-0000-0000-000000000001")
@@ -76,6 +242,119 @@ class ResumeTests(unittest.TestCase):
             env=environment, text=True, capture_output=True, check=True,
         )
         self.assertEqual(result.stdout.strip(), infra.SUBSCRIPTION)
+
+    def test_linux_run_pins_file_store_for_resume_and_cleanup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            results = Path(directory) / "results"
+            with (patch("infra.RESULTS", results), patch("infra.Path.home", return_value=Path(directory)),
+                  patch("infra.sys.platform", "linux"), patch("infra.REDACTIONS", []),
+                  patch("infra.secrets.token_hex", return_value="1234abcd"),
+                  patch("infra.ctypes.CDLL") as api, patch("infra.az") as azure,
+                  patch("infra.execute") as execute):
+                with patch("sys.argv", ["infra.py", __file__]):
+                    infra.main()
+                state, password, _ = execute.call_args.args
+                self.assertEqual(state["credential_store"], "file")
+                state_path = results / state["run_id"] / "state.json"
+                self.assertNotIn(password, state_path.read_text())
+                credential = infra.FileCredentials()
+                self.assertEqual(credential.get(state["credential_account"]), password)
+                azure.assert_not_called()
+                azure.side_effect = [True, {"tags": {"BenchmarkRun": state["run_id"]}}]
+                with (patch("sys.argv", ["infra.py", "--resume", state["run_id"]]),
+                      patch("infra.sys.platform", "darwin")):
+                    infra.main()
+                self.assertEqual(execute.call_count, 2)
+                self.assertEqual(execute.call_args.args[1], password)
+                with (patch("sys.argv", ["infra.py", "--cleanup", state["run_id"]]),
+                      patch("infra.cleanup") as cleanup):
+                    infra.main()
+                cleanup.assert_called_once_with(state["group"], state["run_id"])
+                with self.assertRaisesRegex(RuntimeError, "missing"):
+                    credential.get(state["credential_account"])
+                saved = json.loads(state_path.read_text())
+                self.assertEqual(saved["phase"], "deleted")
+                self.assertTrue(saved["credential_removed"])
+                api.assert_not_called()
+
+    def test_new_run_can_explicitly_choose_file_store_on_macos(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (patch("infra.RESULTS", Path(directory) / "results"),
+                  patch("infra.Path.home", return_value=Path(directory)),
+                  patch("infra.sys.platform", "darwin"), patch("infra.REDACTIONS", []),
+                  patch("sys.argv", ["infra.py", __file__, "--credential-store", "file"]),
+                  patch("infra.execute") as execute, patch("infra.ctypes.CDLL") as api):
+                infra.main()
+                state, password, _ = execute.call_args.args
+                self.assertEqual(state["credential_store"], "file")
+                self.assertEqual(infra.Credentials("file").get(state["credential_account"]), password)
+                api.assert_not_called()
+
+    def test_new_macos_run_pins_keychain_store(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with (patch("infra.RESULTS", Path(directory) / "results"),
+                  patch("infra.sys.platform", "darwin"), patch("infra.REDACTIONS", []),
+                  patch("sys.argv", ["infra.py", __file__]),
+                  patch("infra.execute") as execute, patch("infra.KeychainCredentials") as keychain):
+                keychain.return_value.create.return_value = "secret"
+                infra.main()
+                state, password, _ = execute.call_args.args
+                self.assertEqual(state["credential_store"], "keychain")
+                self.assertEqual(password, "secret")
+                keychain.return_value.create.assert_called_once_with(state["credential_account"])
+
+    def test_legacy_keychain_run_does_not_fall_back_to_file_on_linux(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.state()
+            atomic_json(Path(directory) / state["run_id"] / "state.json", state)
+            with (patch("infra.RESULTS", Path(directory)), patch("infra.sys.platform", "linux"),
+                  patch("sys.argv", ["infra.py", "--resume", state["run_id"]]),
+                  patch("infra.az", side_effect=[True, {"tags": {"BenchmarkRun": state["run_id"]}}]),
+                  patch("infra.FileCredentials") as files, patch("infra.execute") as execute):
+                with self.assertRaisesRegex(RuntimeError, "original Mac"):
+                    infra.main()
+                files.assert_not_called()
+                execute.assert_not_called()
+
+    def test_unknown_saved_store_fails_before_cloud_access(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = self.state()
+            state["credential_store"] = "unsupported"
+            atomic_json(Path(directory) / state["run_id"] / "state.json", state)
+            with (patch("infra.RESULTS", Path(directory)),
+                  patch("sys.argv", ["infra.py", "--resume", state["run_id"]]),
+                  patch("infra.az") as azure, patch("infra.Credentials") as credentials):
+                with self.assertRaisesRegex(RuntimeError, "Unknown saved credential store"):
+                    infra.main()
+                azure.assert_not_called()
+                credentials.assert_not_called()
+
+    def test_retained_run_store_cannot_be_overridden(self):
+        for action in ("--resume", "--cleanup"):
+            with (self.subTest(action=action),
+                  patch("sys.argv", ["infra.py", action, "1234abcd", "--credential-store", "file"]),
+                  patch("sys.stderr", io.StringIO()), patch("infra.az") as azure,
+                  patch("infra.Credentials") as credentials):
+                with self.assertRaises(SystemExit) as exited:
+                    infra.main()
+                self.assertEqual(exited.exception.code, 2)
+                azure.assert_not_called()
+                credentials.assert_not_called()
+
+    def test_credential_write_failure_prevents_cloud_operations(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            credential_directory = home / ".horizon-bench-credentials"
+            credential_directory.mkdir(mode=0o755)
+            credential_directory.chmod(0o755)
+            with (patch("infra.RESULTS", home / "results"),
+                  patch("infra.Path.home", return_value=home),
+                  patch("sys.argv", ["infra.py", __file__, "--credential-store", "file"]),
+                  patch("infra.az") as azure, patch("infra.execute") as execute):
+                with self.assertRaisesRegex(RuntimeError, "mode 0700"):
+                    infra.main()
+                azure.assert_not_called()
+                execute.assert_not_called()
 
     def test_atomic_write_and_controller_exclusion(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -159,6 +438,7 @@ class ResumeTests(unittest.TestCase):
                 credentials.return_value.delete.side_effect = lambda _: events.append("credential")
                 infra.finish_cleanup(state)
             self.assertEqual(events, ["deleted", "credential"])
+            credentials.assert_called_once_with("keychain")
             self.assertEqual(state["phase"], "deleted")
             with (patch("infra.RESULTS", Path(directory)),
                   patch("infra.cleanup", side_effect=RuntimeError("not deleted")),
@@ -259,9 +539,10 @@ class ResumeTests(unittest.TestCase):
             with (patch("infra.RESULTS", Path(directory)),
                   patch("sys.argv", ["infra.py", "--resume", state["run_id"], "--extend-hours", "8"]),
                   patch("infra.az", side_effect=[True, {"tags": {"BenchmarkRun": state["run_id"]}}, {}]),
-                  patch("infra.Credentials"), patch("infra.execute") as execute):
+                  patch("infra.Credentials") as credentials, patch("infra.execute") as execute):
                 infra.main()
                 self.assertEqual(execute.call_count, 1)
+                credentials.assert_called_once_with("keychain")
                 saved = json.loads((Path(directory) / state["run_id"] / "state.json").read_text())
                 self.assertGreater(dt.datetime.fromisoformat(saved["expires_utc"]), dt.datetime.now(dt.timezone.utc))
 

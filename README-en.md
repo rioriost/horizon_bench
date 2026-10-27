@@ -8,7 +8,7 @@ This repository contains only the code needed to reproduce the benchmark and off
 
 ## Prerequisites
 
-Creating or resuming an actual Azure environment requires macOS Keychain, Python 3, Azure CLI, and `ssh-keygen`. No additional pip packages are required for the local Python environment. Tests also require `tclsh`; the tests alone can run on Linux.
+Creating or resuming an actual Azure environment requires macOS or Linux (WSL2 on Windows), Python 3, Azure CLI, and `ssh-keygen`. No additional pip packages are required for the local Python environment. Tests also require `tclsh`. Native Windows execution is not supported because the controller uses POSIX facilities such as file locking. On WSL2, install Python and Azure CLI inside Linux and keep both the repository and home directory on the Linux filesystem.
 
 ```sh
 git clone https://github.com/rioriost/horizon_bench.git
@@ -25,6 +25,16 @@ To use a different subscription, explicitly set `AZURE_SUBSCRIPTION_ID` to its U
 If `az horizondb --help` is unavailable, obtain an Azure CLI installation and subscription that support HorizonDB. You need eligibility to use HorizonDB, service availability in Japan East, sufficient VM and database quotas, and permission to create resources and assign roles. Consult the current official documentation for CLI extensions and service availability. Offline tests do not use an Azure login or database credentials.
 
 The client VMs run Ubuntu 24.04. `setup.sh` installs dependencies including Python 3, psycopg2, the PostgreSQL 17 client, pgbench, and HammerDB 6.1. The HammerDB distribution is verified using SHA-256. Initial setup requires outbound connectivity from the VMs to the Ubuntu, PostgreSQL, and GitHub distribution endpoints.
+
+## Credential storage
+
+New runs default to `keychain` on macOS and `file` on Linux/WSL2. Use `--credential-store keychain` or `--credential-store file` to choose explicitly for a new run only. The selected store is recorded in `state.json` and reused for resume and cleanup. Older runs without a saved store are treated as Keychain runs and are not automatically migrated.
+
+`keychain` stores the password in macOS Keychain. It passes the password directly to the OS API, not as a Keychain command-line argument. Resuming an existing Keychain run requires its Keychain item on the original Mac.
+
+`file` generates a password and saves it to `~/.horizon-bench-credentials/<subscription>-<run_id>`. The directory uses mode `0700` and files use mode `0600`. The store rejects ownership by another user, incorrect permissions, symbolic links, and files with multiple hard links. It never overwrites an existing file or automatically regenerates unknown or missing credentials. No desktop session or additional credential-management service is needed.
+
+**File storage is not encrypted.** Use a trusted, dedicated user account and encrypted storage; do not publish, share, or add the credential directory to Git. Home-directory backups may also contain passwords. Resuming requires both the same user's credentials and `results/<run_id>/`. Both stores verify that the saved password can be read back before creating Azure resources, and delete only that run's credential after environment deletion is confirmed.
 
 ## Comparing the same data sizes and workloads
 
@@ -50,12 +60,15 @@ Errors, deadline expiration, Ctrl+C, and SIGTERM do not delete databases, disks,
 
 If an Azure REST GET that reads Run Command status fails due to DNS resolution, it is retried up to six times including the initial attempt, with delays of 2, 4, 8, 16, and 30 seconds. Both waits and calls remain subject to the original execution deadline and a one-hour limit per operation. Non-DNS failures and create, update, start, stop, and delete operations are not automatically retried. VMs stopped externally are not automatically restarted.
 
-Execution requires macOS, Python 3, an authenticated Azure CLI session, and permission to create resources and assign roles in the selected subscription. The database password is stored in macOS Keychain and verified to be readable before deployment. It is passed directly to the OS API, not as a Keychain command-line argument. Resuming requires both the Keychain item on the same Mac and `results/<run_id>/`. Local regression checks also use `tclsh`.
+Execution requires an authenticated Azure CLI session and permission to create resources and assign roles in the selected subscription. Resuming requires both the credentials for the store described above and `results/<run_id>/`.
 
 ```sh
 python3 -m unittest -q
 # Start a new run. Its run_id is also recorded in results/<run_id>/state.json.
 python3 infra.py run_benchmark.py
+
+# Explicitly select file storage for a new run, including on macOS.
+python3 infra.py run_benchmark.py --credential-store file
 
 # Reconnect to an active environment. Stopped VMs are not started automatically.
 python3 infra.py --resume RUN_ID
@@ -66,7 +79,7 @@ python3 infra.py --resume RUN_ID --start-clients
 # If the execution deadline has passed, review costs and extend the stop deadline by 16 hours.
 python3 infra.py --resume RUN_ID --start-clients --extend-hours 16
 
-# Keep saved results, but delete the dedicated Azure environment and Keychain item.
+# Keep saved results, but delete the dedicated Azure environment and this run's credential.
 python3 infra.py --cleanup RUN_ID
 ```
 
@@ -90,7 +103,7 @@ Before running, review database, VM, and storage prices and costs in the target 
 
 ## Handling results and connection information
 
-`results/<run_id>/` stores state, resume records, Azure configuration, per-measurement JSON files, and TPROC-C CSV files. State and result files are replaced only after writing and syncing a temporary file. Passwords are not written to these files; they are passed to VMs as protected Run Command parameters. The Keychain item is deleted only after environment deletion is confirmed. No inbound SSH rule is opened for the VMs. SQL connections verify certificates and hostnames.
+`results/<run_id>/` stores state, resume records, Azure configuration, per-measurement JSON files, and TPROC-C CSV files. State and result files are replaced only after writing and syncing a temporary file. Passwords are not written to these files; they are passed to VMs as protected Run Command parameters. The Keychain item or that run's credential file is deleted only after environment deletion is confirmed. No inbound SSH rule is opened for the VMs. SQL connections verify certificates and hostnames.
 
 Measurement logs are saved in full. Only highly repetitive data-build progress lines are reduced to the first 50 and last 50 lines, with the omitted line count and original log hash recorded. CPU and similar metrics are saved as aggregates calculated from samples taken during measurement. Full progress logs for completed builds remain on the VMs but disappear when the dedicated environment is deleted.
 

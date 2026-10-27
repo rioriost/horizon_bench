@@ -1,6 +1,7 @@
 """Provision, resume, pause and explicitly clean up an isolated benchmark."""
 
 import argparse
+from contextlib import contextmanager
 import ctypes
 import datetime as dt
 import json
@@ -8,6 +9,7 @@ import os
 import re
 import secrets
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
@@ -27,14 +29,15 @@ REDACTIONS = []
 RESULTS = Path(__file__).with_name("results")
 
 
-class Credentials:
+class KeychainCredentials:
     """Use the macOS login Keychain without putting passwords in process argv."""
 
     SERVICE = b"horizon-bench"
 
     def __init__(self):
         if sys.platform != "darwin":
-            raise RuntimeError("Resumable credentials currently require macOS Keychain")
+            raise RuntimeError("This run uses macOS Keychain; use the original Mac to resume or "
+                               "remove its credential")
         self.api = ctypes.CDLL("/System/Library/Frameworks/Security.framework/Security")
         pointer = ctypes.c_void_p
         self.api.SecKeychainFindGenericPassword.argtypes = [
@@ -102,6 +105,122 @@ class Credentials:
                     raise RuntimeError(f"Keychain deletion failed (OSStatus {status})")
             finally:
                 self.api.CFRelease(item)
+
+
+class FileCredentials:
+    """Keep generated passwords outside results in owner-only POSIX files."""
+
+    def __init__(self):
+        self.path = Path.home() / ".horizon-bench-credentials"
+
+    @contextmanager
+    def directory(self, create=False):
+        if create:
+            try:
+                self.path.mkdir(mode=0o700)
+            except FileExistsError:
+                pass
+            else:
+                parent = os.open(self.path.parent, os.O_RDONLY | os.O_DIRECTORY)
+                try:
+                    os.fsync(parent)
+                finally:
+                    os.close(parent)
+        try:
+            descriptor = os.open(self.path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            yield None
+            return
+        try:
+            info = os.fstat(descriptor)
+            require(info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o700,
+                    "Credential directory must be owned by the current user with mode 0700")
+            yield descriptor
+        finally:
+            os.close(descriptor)
+
+    def filename(self, account):
+        require(bool(re.fullmatch(
+            r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}/[0-9a-f]{8}", account,
+        )), "Invalid credential account")
+        return account.replace("/", "-")
+
+    def read(self, directory, account):
+        name = self.filename(account)
+        if directory is None:
+            return None
+        try:
+            descriptor = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK,
+                                 dir_fd=directory)
+        except FileNotFoundError:
+            return None
+        with os.fdopen(descriptor) as stream:
+            info = os.fstat(stream.fileno())
+            require(stat.S_ISREG(info.st_mode) and info.st_nlink == 1
+                    and info.st_uid == os.getuid() and stat.S_IMODE(info.st_mode) == 0o600,
+                    "Credential file must be a regular, single-link file owned by the "
+                    "current user with mode 0600")
+            value = stream.read(128)
+        require(bool(re.fullmatch(r"B9![A-Za-z0-9_-]{38}\n", value)),
+                "Credential file is invalid; refusing to use or overwrite it")
+        return value.rstrip("\n")
+
+    def get(self, account):
+        with self.directory() as directory:
+            value = self.read(directory, account)
+        require(value is not None, "Run credential file is missing; cannot resume")
+        return value
+
+    def create(self, account):
+        name = self.filename(account)
+        with self.directory(create=True) as directory:
+            try:
+                descriptor = os.open(
+                    name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                    0o600, dir_fd=directory,
+                )
+            except FileExistsError:
+                raise RuntimeError("Refusing to replace an existing run credential") from None
+            value = "B9!" + secrets.token_urlsafe(28)
+            with os.fdopen(descriptor, "w") as stream:
+                stream.write(value + "\n")
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.fsync(directory)
+            require(self.read(directory, account) == value,
+                    "Credential file round-trip failed; no deployment started")
+        return value
+
+    def delete(self, account):
+        with self.directory() as directory:
+            if self.read(directory, account) is not None:
+                os.unlink(self.filename(account), dir_fd=directory)
+                os.fsync(directory)
+
+
+def default_credential_store():
+    return "keychain" if sys.platform == "darwin" else "file"
+
+
+class Credentials:
+    def __init__(self, backend=None):
+        if backend is None:
+            backend = default_credential_store()
+        if backend == "keychain":
+            self.store = KeychainCredentials()
+        elif backend == "file":
+            self.store = FileCredentials()
+        else:
+            raise RuntimeError(f"Unknown credential store: {backend}")
+
+    def get(self, account):
+        return self.store.get(account)
+
+    def create(self, account):
+        return self.store.create(account)
+
+    def delete(self, account):
+        self.store.delete(account)
 
 
 def az(*args, secret=False, cleanup=False):
@@ -406,11 +525,15 @@ def main():
     action.add_argument("--cleanup", metavar="RUN_ID")
     parser.add_argument("--start-clients", action="store_true", help="Explicitly start stopped clients once")
     parser.add_argument("--extend-hours", type=float, help="Explicitly extend a retained run's pause deadline")
+    parser.add_argument("--credential-store", choices=("keychain", "file"),
+                        help="New runs only; default: keychain on macOS, file on Linux/WSL")
     args = parser.parse_args()
     if (args.resume or args.cleanup) and args.benchmark:
         parser.error("A retained run uses its saved benchmark runner; omit the positional argument")
     if (args.start_clients or args.extend_hours is not None) and not args.resume:
         parser.error("--start-clients and --extend-hours require --resume")
+    if args.credential_store is not None and (args.resume or args.cleanup):
+        parser.error("--credential-store is for new runs; retained runs use their saved store")
     if args.extend_hours is not None and not 0 < args.extend_hours <= 72:
         parser.error("--extend-hours must be greater than zero and at most 72")
     try:
@@ -437,6 +560,8 @@ def main():
             if state.get("format") == FORMAT:
                 require(state["credential_account"] == f"{SUBSCRIPTION}/{run_id}",
                         "Credential reference does not match this run")
+                require(state.get("credential_store", "keychain") in ("keychain", "file"),
+                        "Unknown saved credential store")
         else:
             expires = dt.datetime.now(dt.timezone.utc) + dt.timedelta(seconds=TIME_LIMIT_SECONDS)
             state = {
@@ -445,6 +570,7 @@ def main():
                 "expires_utc": expires.isoformat(), "phase": "preparing",
                 "benchmark": str(args.benchmark.resolve()),
                 "credential_account": f"{SUBSCRIPTION}/{run_id}",
+                "credential_store": args.credential_store or default_credential_store(),
             }
             save_state(state)
         if args.cleanup:
@@ -475,7 +601,7 @@ def main():
         remaining = dt.datetime.fromisoformat(state["expires_utc"]).timestamp() - time.time() - 3600
         require(remaining > 0, "Execution window expired; review retained costs and use --extend-hours")
         DEADLINE = time.monotonic() + remaining
-        store = Credentials()
+        store = Credentials(state.get("credential_store", "keychain"))
         password = store.get(state["credential_account"]) if args.resume else store.create(state["credential_account"])
         REDACTIONS.append(password)
         execute(state, password, args)
@@ -489,7 +615,7 @@ def finish_cleanup(state):
     state["deleted_utc"] = dt.datetime.now(dt.timezone.utc).isoformat()
     save_state(state)
     if state.get("credential_account"):
-        Credentials().delete(state["credential_account"])
+        Credentials(state.get("credential_store", "keychain")).delete(state["credential_account"])
         state["credential_removed"] = True
         save_state(state)
 

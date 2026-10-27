@@ -8,7 +8,7 @@ Azure東日本に専用環境を作成し、HammerDB 6.1のTPROC-Cで比較す�
 
 ## 実行前の準備
 
-実際のAzure環境の作成・再開には、macOSのKeychain、Python 3、Azure CLI、`ssh-keygen`が必要となる。ローカルPythonに追加のpipパッケージは不要。テストには`tclsh`も必要で、テストだけならLinuxでも実行できる。
+実際のAzure環境の作成・再開には、macOSまたはLinux（WindowsではWSL2）、Python 3、Azure CLI、`ssh-keygen`が必要となる。ローカルPythonに追加のpipパッケージは不要。テストには`tclsh`も必要となる。POSIXのファイルロックなどを使うため、Windowsネイティブでの実行には対応しない。WSL2ではPython・Azure CLIをLinux側にインストールし、リポジトリとホームディレクトリをLinuxファイルシステム上に置く。
 
 ```sh
 git clone https://github.com/rioriost/horizon_bench.git
@@ -25,6 +25,16 @@ python3 -m unittest -q
 `az horizondb --help`が利用できない場合は、HorizonDBを利用できるAzure CLIとサブスクリプションを準備する。HorizonDBの利用資格、Japan Eastでの提供状況、VM・DBのクォータ、リソース作成とロール割り当ての権限が必要になる。CLI拡張機能やサービスの提供状況は利用時点の公式ドキュメントで確認する。オフラインテストではAzureログインもDB資格情報も使わない。
 
 クライアントVMにはUbuntu 24.04を使い、`setup.sh`でPython 3・psycopg2、PostgreSQL 17クライアント・pgbench、HammerDB 6.1などを導入する。HammerDBの配布物はSHA-256を検証する。初期導入にはVMからUbuntu・PostgreSQL・GitHubの配布先への通信が必要となる。
+
+## 資格情報の保存方式
+
+新規実行の既定値は、macOSでは`keychain`、Linux／WSL2では`file`となる。`--credential-store keychain`または`--credential-store file`で新規実行時だけ明示的に選べる。保存方式は`state.json`に記録し、再開・削除でも同じ方式を使う。保存方式の記録がない従来の実行はKeychainとして扱い、自動移行しない。
+
+`keychain`はmacOSのKeychainに保存する。パスワードをKeychain用コマンドの引数に載せず、OSのAPIへ直接渡す。既存のKeychain方式の実行を再開するには、元のMacのKeychain項目が必要となる。
+
+`file`はパスワードを自動生成し、`~/.horizon-bench-credentials/<subscription>-<run_id>`に保存する。ディレクトリは`0700`、ファイルは`0600`とし、現在のユーザー以外の所有物、不適切な権限、シンボリックリンク、複数のハードリンクがあるファイルを拒否する。既存ファイルの上書きや、不明・欠損した資格情報からの自動再生成は行わない。デスクトップ環境や追加の資格情報管理サービスは不要となる。
+
+**ファイル方式は暗号化しない。** 信頼できる専用ユーザーと暗号化されたディスクを使い、資格情報ディレクトリを公開・共有・Git登録しないこと。ホームディレクトリのバックアップにもパスワードが含まれ得る。再開には、同じユーザーの資格情報と`results/<run_id>/`の両方を残す必要がある。どちらの方式でも、保存後の読み戻しを確認してからAzureリソースを作成し、環境の削除を確認してから当該実行の資格情報だけを削除する。
 
 ## 同じデータ量と負荷で測る
 
@@ -50,12 +60,15 @@ TPROC-Cの5種類のトランザクション混合は変更しない。全wareho
 
 Run Commandの状態を読むAzure REST GETがDNSの名前解決で失敗した場合は、2・4・8・16・30秒の待機を挟み、初回を含め最大6回試す。待機と呼び出しには、元の実行期限と1操作あたり1時間の上限を適用する。DNS以外の失敗や、作成・更新・起動・停止・削除の操作は自動で再試行しない。外部から停止されたVMを自動起動することもない。
 
-実行にはmacOS、Python 3、Azure CLIへのログイン、このサブスクリプションへのリソース作成・ロール割り当て権限が必要となる。DBパスワードはmacOSのKeychainに保存し、読み戻せることを確認してからデプロイする。パスワードをKeychain用コマンドの引数に載せず、OSのAPIへ直接渡す。再開には同じMacのKeychain項目と`results/<run_id>/`の両方が必要になる。ローカルの回帰確認には`tclsh`も使う。
+実行にはAzure CLIへのログインと、このサブスクリプションへのリソース作成・ロール割り当て権限が必要となる。再開には上記の保存方式に対応する資格情報と`results/<run_id>/`の両方が必要になる。
 
 ```sh
 python3 -m unittest -q
 # 新規実行。run_idはresults/<run_id>/state.jsonにも記録される。
 python3 infra.py run_benchmark.py
+
+# macOSでもファイル方式を明示して新規実行できる。
+python3 infra.py run_benchmark.py --credential-store file
 
 # 稼働中の環境に再接続する。停止済みのVMは自動起動しない。
 python3 infra.py --resume RUN_ID
@@ -66,7 +79,7 @@ python3 infra.py --resume RUN_ID --start-clients
 # 実行期限を過ぎた場合。費用を確認してから、停止期限を16時間延長する。
 python3 infra.py --resume RUN_ID --start-clients --extend-hours 16
 
-# 保存した結果を残し、専用のAzure環境とKeychain項目を削除する。
+# 保存した結果を残し、専用のAzure環境と当該実行の資格情報を削除する。
 python3 infra.py --cleanup RUN_ID
 ```
 
@@ -90,7 +103,7 @@ VMの割り当て解除中はVM内のタイマーも動作しない。組織ポ�
 
 ## 結果と接続情報の扱い
 
-`results/<run_id>/`に状態、再開用の記録、Azure構成、各測定のJSON、TPROC-CのCSVを保存する。状態・結果ファイルは一時ファイルへの書き込みと同期を済ませてから置き換える。パスワードはこれらのファイルに書かず、VMへはRun Commandの保護パラメーターとして渡す。環境の削除を確認してからKeychain項目を削除する。VMのSSH受信ルールは開けない。SQL接続は証明書とホスト名を検証する。
+`results/<run_id>/`に状態、再開用の記録、Azure構成、各測定のJSON、TPROC-CのCSVを保存する。状態・結果ファイルは一時ファイルへの書き込みと同期を済ませてから置き換える。パスワードはこれらのファイルに書かず、VMへはRun Commandの保護パラメーターとして渡す。環境の削除を確認してからKeychain項目または当該実行の資格情報ファイルを削除する。VMのSSH受信ルールは開けない。SQL接続は証明書とホスト名を検証する。
 
 測定ログは全体を保存する。大量に繰り返されるデータ構築の進捗行だけは先頭50行・末尾50行に絞り、省略行数と元ログのハッシュを明記する。CPUなどは測定中の標本から計算した集計値を保存する。完了した構築の全進捗ログはVM上に残すが、専用環境の削除とともに消える。
 
