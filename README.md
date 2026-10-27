@@ -1,5 +1,7 @@
 # HorizonDBとFlexible Serverの比較測定
 
+[English](README-en.md)
+
 Azure東日本に専用環境を作成し、HammerDB 6.1のTPROC-Cで比較する。既存のDBやVMは使用しない。
 
 このリポジトリには再現用コードとオフラインテストだけを含める。測定結果、プレゼンテーション、実行履歴、個別環境の識別子、資格情報は公開しない。実行によって生成される`results/`もGitの追跡対象外とする。
@@ -103,3 +105,7 @@ Azure管理メトリクスは、取得する指標の組み合わせごとに、
 - [HammerDB 6.1](https://github.com/TPC-Council/HammerDB/releases/tag/v6.1)
 - [HammerDBのTPROC-C](https://www.hammerdb.com/docs/ch03s05.html)
 - [Linux VMのManaged Run Command](https://learn.microsoft.com/azure/virtual-machines/linux/run-command-managed)
+
+## ライセンス
+
+[MIT License](LICENSE)
